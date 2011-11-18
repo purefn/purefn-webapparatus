@@ -1,26 +1,34 @@
 package purefn.web
 package apparatus
 
-import scalaz._, Scalaz._, effect._, scalaz.iteratee._
+import purefn.web.{CaseInsensitive => CI} 
+import Response.{fourOhSix, modifyResponseBody}
+import Headers.{getHeaders, setHeader}
 
-import Web._
+import scalaz._, effect._, scalaz.iteratee._
+import NonEmptyList._, Validation._
+import syntax.equal._
+import syntax.monoid._
+import syntax.pointed._
+import syntax.traverse._
+import syntax.std.optionV._
+import std.option._
+import std.string._
 
-object WebResource extends WebResources
+object WebResource extends WebResourceFunctions {
+  def apply[S, C](
+      init: InitFn[S, C] = initIdent[S],
+      contentTypesProvided: ContentTypesProvidedFn[C]): WebFn[S, Unit] = webResource(init, contentTypesProvided)
+}
 
-trait WebResources {
-  type WebResourceIter[A] = IterateeT[Throwable, String, IO, A]
-  type InitFn[S, C] = ReaderT[S, WebState, C]
-  type WebResourceFn[C, A] = StateT[(C, WebData), WebResourceIter, A]
-  type BodyProducingFn[C] = WebResourceFn[C, ResponseBody]
-  type ContentTypesProvidedFn[C] = WebResourceFn[C, NonEmptyList[(String, BodyProducingFn[C])]]
-
+trait WebResourceFunctions {
   implicit def provideContentTypes[C](ts: NonEmptyList[(String, BodyProducingFn[C])]): ContentTypesProvidedFn[C] = 
-    stateT(s => (ts, s).point[WebResourceIter])
+    StateT(s => (ts, s).point[WebResourceIter])
 
   implicit def provideContentType[C](t: (String, BodyProducingFn[C])): ContentTypesProvidedFn[C] =
     provideContentTypes(nels(t))
 
-  def initIdent[S]: InitFn[S, S] = kleisli(s => s.point[WebState])
+  def initIdent[S]: InitFn[S, S] = Kleisli(s => s.point[WebState])
     
   def webResource[S, C](
       init: InitFn[S, C] = initIdent[S],
@@ -35,8 +43,8 @@ trait WebResources {
         cts.list.find(ct => ct._1 === "text/html").toSuccess(fourOhSix)
         
       getRequest[C] map 
-        getHeaders[Request]("Accept") map 
-        (_ map (findBestMatch) getOrElse (cts.head.success))
+        getHeaders[Request](CI("Accept")) map 
+        (_ map (findBestMatch) getOrElse (success(cts.head)))
     }
     
     def runBodyProducingFn(fn: (String, BodyProducingFn[C])): WebResourceFnC[Unit] = fn._2 flatMap (enum =>
@@ -44,45 +52,45 @@ trait WebResources {
         modifyResponseBody(new (ResponseEnumT ~> ResponseEnumT) {
           def apply[A](e: ResponseEnumT[A]) = e |+| enum[A]
         }) andThen 
-        setHeader[Response]("Content-Type", fn._1)
+        setHeader[Response](CI("Content-Type"), fn._1)
       ))
     
     def addBodyToResponse(b: ResponseBody): WebResourceFnC[Unit] =
       modifyResponse(modifyResponseBody(new (ResponseEnumT ~> ResponseEnumT) {
         def apply[A](e: ResponseEnumT[A]) = e |+| b[A]
       }))
-      
+
     def stateMachine: WebResourceFnC[Validation[Response, Unit]] =
       for {
         contentTypes <- contentTypesProvided
         bodyFn       <- pickBodyProducingFn(contentTypes)
-        result       <- (bodyFn map runBodyProducingFn).sequence[WebResourceFnC, Unit]
+        result       <- (bodyFn map runBodyProducingFn).traverse(identity) // couldn't get sequence working here
       } yield result
       
     def dropContext(r: (Validation[Response, Unit], (C, WebData))) = (some(r._1), r._2._2)
 
-    kleisli(s => Web(stateT[WebData, WebIter, Option[Validation[Response, Unit]]](wd => 
-      init(s) runT(wd) flatMap(s => 
-        stateMachine runT(s) map dropContext))))
+    Kleisli(s => Web(StateT[WebIter, WebData, Option[Validation[Response, Unit]]](wd => 
+      init(s) apply (wd) flatMap(s => 
+        stateMachine apply (s) map dropContext))))
   }
   
   /* WebResourceFn versions of get, modify, and put */
-  def get[C]: WebResourceFn[C, (C, WebData)] = getT[(C, WebData), WebResourceIter]
+  def init[C]: WebResourceFn[C, (C, WebData)] = MonadState[WebResourceIterState, (C, WebData)].init
 
-  def put[C](cwd: => (C, WebData)): WebResourceFn[C, Unit] = putT[(C, WebData), WebResourceIter](cwd)
+  def put[C](cwd: => (C, WebData)): WebResourceFn[C, Unit] = MonadState[WebResourceIterState, (C, WebData)].put(cwd)
   
   def modify[C](f: (C, WebData) => (C, WebData)): WebResourceFn[C, Unit] =
-    modifyT[(C, WebData), WebResourceIter](cw => f(cw._1, cw._2))
+    MonadState[WebResourceIterState, (C, WebData)].modify(cw => f(cw._1, cw._2))
 
   /* Request handling functions */
-  def getRequest[C]: WebResourceFn[C, Request] = get map (_._2.request)
+  def getRequest[C]: WebResourceFn[C, Request] = init map (_._2.request)
 
   def putRequest[C](request: Request): WebResourceFn[C, Unit] = modify((c, w) => (c, w.copy(request = request)))
 
   def modifyRequest[C](f: Request => Request): WebResourceFn[C, Unit] = modify((c, w) => (c, w.copy(request = f(w.request))))
 
   /* Response handling functions */
-  def getResponse[C]: WebResourceFn[C, Response] = get map (_._2.response)
+  def getResponse[C]: WebResourceFn[C, Response] = init map (_._2.response)
 
   def putResponse[C](response: Response): WebResourceFn[C, Unit] = modify((c, w) => (c, w.copy(response = response)))
 
@@ -90,16 +98,9 @@ trait WebResources {
     modify((c, w) => (c, w.copy(response = f(w.response))))
     
   /* Request context handling functions */
-  def getContext[C]: WebResourceFn[C, C] = get map(_._1)
+  def getContext[C]: WebResourceFn[C, C] = init map(_._1)
   
   def putContext[C](c: C): WebResourceFn[C, Unit] = modify((_, w) => (c, w))
   
   def modifyContext[C](f: C => C): WebResourceFn[C, Unit] = modify((c, w) => (f(c), w))
-  
-  def fourOhSix: Response = 
-    Response(
-      status = 406,
-      statusReason = "Not Acceptable",
-      contentLength = some(0)
-    )
 }

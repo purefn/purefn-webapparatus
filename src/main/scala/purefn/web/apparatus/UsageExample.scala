@@ -1,21 +1,28 @@
 package purefn.web
 package apparatus
 
-import scalaz._, Scalaz._, scalaz.iteratee._, effect._
+import purefn.web.apparatus.{WebResource => wr}, wr.{getRequest => _, _}
+import Response._, PathTemplate._, Route._
+
+import scalaz._, scalaz.iteratee._, effect._
+import NonEmptyList._
+import syntax.pointed._
+import syntax.show._
+import syntax.std.stringV._
+import std.anyVal._
+import std.string._
 
 sealed trait Config {
   val name: String
 }
 
 object UsageExample {
-  import Web._, purefn.web.apparatus.{WebResource => wr}, wr.{getRequest => _, _}
-    
   type AppWebFn[A] = WebFn[Config, A]
    
   def hello: AppWebFn[Unit] = {
     case class Say(greeting: String)
     
-    def init: InitFn[Config, Say] = (c: Config) => Say("Hello, world! From " + c.name).point[WebState]
+    def init: InitFn[Config, Say] = Kleisli(c => Say("Hello, world! From " + c.name).point[WebState])
     
     def toHtml: BodyProducingFn[Say] = for {
       c <- wr.getContext
@@ -27,7 +34,7 @@ object UsageExample {
  
   def fibonacci: AppWebFn[Unit] = {
     
-    def init: InitFn[Config, Unit] = (c: Config) => ().point[WebState]
+    def init: InitFn[Config, Unit] = Kleisli(c => ().point[WebState])
     lazy val fib: Stream[Long] = Stream.cons(1, Stream.cons(2, fib.zip(fib.tail).map(x => x._1 + x._2)))
     
     def toHtml: BodyProducingFn[Unit] = for {
@@ -47,26 +54,30 @@ object UsageExample {
     , (pathLit("hello"), hello)
     , (helloPt, hello)
     , (fibPt, fibonacci)
-  )
+    )
 
   println(helloPt(() :: "and stuff" :: List("dudes and dudettes") :: HNil))
-   
+
   def main(args: Array[String]): Unit = mainIO(args) unsafePerformIO 
   
   def mainIO(args: Array[String]): IO[Unit] = {
+    import IO._
+    import syntax.bind._
+    import IterateeT._
+    
     val config = new Config { val name = "Usage Example!" }
     val request = Request(
       pathInfo = "hello",
       headers = Map(CaseInsensitive("Accept") -> nels("text/html")))
 
-    router(config).run(request).runT(throwIO(_)) flatMap  (rr =>
+    router(config).run(request)(throwIO(_)) flatMap  (rr =>
       // write response to servlet response
-      putStrLn(rr._1.shows) >|>
-        putStrLn(rr._2.shows) >|>
-        putStrLn("Response body") >|>
-        putStrLn("=====================================") >|>
-        ((putStrTo[Throwable, String](System.out) >>== rr._2.body[Unit]) runT(throwIO(_))) >|>
-        putStrLn("") >|>
+      putStrLn(rr._1.shows) >>
+        putStrLn(rr._2.shows) >>
+        putStrLn("Response body") >>
+        putStrLn("=====================================") >>
+//        ((putStrTo[Throwable, String](System.out) >>== rr._2.body[Unit]) apply (throwIO(_))) >>
+        putStrLn("") >>
         putStrLn("=====================================")
       )
   }
